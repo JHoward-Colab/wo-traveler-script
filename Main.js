@@ -1,8 +1,56 @@
 /**
- * Main.gs - Clean Baseline Architecture
+ * Main.gs - Clean Baseline Architecture with Trailing-Edge Debounce
  */
 
 function doPost(e) {
+  if (!e || !e.postData || !e.postData.contents) {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "ERROR",
+      message: "No POST body received."
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var data = JSON.parse(e.postData.contents);
+
+  var woNumber = String(
+    data.woNumber || 
+    data["Work Order Number"] || 
+    data["WO Number"] || 
+    data["woNum"] || ""
+  ).trim();
+
+  var workOrderId = String(
+    data.workOrderId || 
+    data.woId || 
+    data["Work Order ID"] || 
+    data["WO ID"] || 
+    data["parentWorkOrderId"] || ""
+  ).trim();
+
+  var cleanWoNum = String(woNumber || "").replace(/[^0-9]/g, "");
+  var debounceTarget = cleanWoNum || workOrderId.toLowerCase();
+
+  // --- Trailing-Edge Debounce (Runs BEFORE LockService) ---
+  // All rapid child/parent webhooks record their timestamp in parallel and wait 5s.
+  // Only the final webhook proceeds to acquire the lock and generate the PDF.
+  if (debounceTarget) {
+    var props = PropertiesService.getScriptProperties();
+    var debounceKey = "DEBOUNCE_" + debounceTarget;
+    var triggerTime = String(new Date().getTime());
+
+    props.setProperty(debounceKey, triggerTime);
+    Utilities.sleep(5000);
+
+    if (props.getProperty(debounceKey) !== triggerTime) {
+      return ContentService.createTextOutput(JSON.stringify({
+        status: "SUCCESS",
+        message: "Superseded by newer burst update (trailing debounce)."
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    props.deleteProperty(debounceKey);
+  }
+  // -------------------------------------------------------
+
   var lock = LockService.getScriptLock();
   var hasLock = false;
   try {
@@ -12,67 +60,29 @@ function doPost(e) {
   }
 
   try {
-    if (!e || !e.postData || !e.postData.contents) {
-      return ContentService.createTextOutput(JSON.stringify({
-        status: "ERROR",
-        message: "No POST body received."
-      })).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    var data = JSON.parse(e.postData.contents);
-
-    var woNumber = String(
-      data.woNumber || 
-      data["Work Order Number"] || 
-      data["WO Number"] || 
-      data["woNum"] || ""
-    ).trim();
-
-    var workOrderId = String(
-      data.workOrderId || 
-      data.woId || 
-      data["Work Order ID"] || 
-      data["WO ID"] || 
-      data["parentWorkOrderId"] || ""
-    ).trim();
-
     var templateId = String(
       data.templateId || 
       data["Template ID"] || 
       (typeof DEFAULT_TEMPLATE_ID !== "undefined" ? DEFAULT_TEMPLATE_ID : "")
     ).trim();
 
-    // 1. Fetch parent and child records
+    // 1. Fetch parent and child records (now that all burst writes have settled)
     var sheetRowData = getWorkOrderRowDataFromSheet(woNumber, workOrderId);
 
     workOrderId = String(sheetRowData["Work Order ID"] || workOrderId || "").trim();
     woNumber = String(sheetRowData["Work Order Number"] || woNumber || "").trim();
 
-    var cleanWoNum = String(woNumber || "").replace(/[^0-9]/g, "");
+    cleanWoNum = String(woNumber || "").replace(/[^0-9]/g, "");
     var formattedWoStr = "WO-" + (cleanWoNum ? ("000000" + cleanWoNum).slice(-6) : "000000");
 
-    // 2. Debounce window (4 seconds)
-    var props = PropertiesService.getScriptProperties();
-    var lockPropKey = "LAST_RUN_" + (cleanWoNum || workOrderId.toLowerCase());
-    var lastRunTime = parseInt(props.getProperty(lockPropKey) || "0", 10);
-    var currentTime = new Date().getTime();
-
-    if (currentTime - lastRunTime < 4000) {
-      return ContentService.createTextOutput(JSON.stringify({
-        status: "SUCCESS",
-        message: "Rapid re-trigger debounced."
-      })).setMimeType(ContentService.MimeType.JSON);
-    }
-    props.setProperty(lockPropKey, String(currentTime));
-
-    // 3. Resolve Revision
+    // 2. Resolve Revision
     var payloadRev = data.revision || data["Revision"] || data["Work Order Revision"] || "";
     var sheetRev = sheetRowData["Revision"] || sheetRowData["Revision Number"] || "";
     var currentRevVal = parseInt(payloadRev !== "" ? payloadRev : sheetRev, 10);
     if (isNaN(currentRevVal) || currentRevVal < 1) currentRevVal = 1;
     var revision = String(currentRevVal).trim();
 
-    // 4. Resolve Product and Quantity
+    // 3. Resolve Product and Quantity
     var productNumber = String(data.productNumber || data["Product Number"] || sheetRowData["Product Number"] || "").trim();
     var productType = String(data.productType || data["Product Type"] || sheetRowData["Product Type"] || sheetRowData["Work Order Type"] || "").trim();
 
@@ -92,7 +102,7 @@ function doPost(e) {
       selectedConsumedSerials = rawConsumed.split(/[\s,]+/).filter(Boolean);
     }
 
-    // 5. Reconcile Finished Goods Serials
+    // 4. Reconcile Finished Goods Serials
     if (workOrderId && productNumber) {
       try {
         var serialSheet = getSerialSheet();
@@ -116,13 +126,13 @@ function doPost(e) {
       }
     }
 
-    // 6. Timestamps
+    // 5. Timestamps
     var timeZone = Session.getScriptTimeZone() || "GMT-7";
     sheetRowData["Generated Timestamp"] = Utilities.formatDate(new Date(), timeZone, "MM/dd/yyyy HH:mm:ss");
     sheetRowData["Printed Date"] = Utilities.formatDate(new Date(), timeZone, "MM/dd/yyyy");
     sheetRowData["Revision"] = revision;
 
-    // 7. Generate PDF
+    // 6. Generate PDF
     var pdfInfo = generateTravelerPDF(woNumber, revision, templateId, sheetRowData);
 
     return ContentService.createTextOutput(JSON.stringify({
