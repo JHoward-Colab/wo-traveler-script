@@ -1,5 +1,5 @@
 /**
- * Main.gs - Clean Baseline Architecture with Trailing-Edge Debounce
+ * Main.gs - Clean Baseline Architecture with Trailing-Edge Debounce & Serial Format Guard
  */
 
 function doPost(e) {
@@ -31,8 +31,7 @@ function doPost(e) {
   var debounceTarget = cleanWoNum || workOrderId.toLowerCase();
 
   // --- Trailing-Edge Debounce (Runs BEFORE LockService) ---
-  // All rapid child/parent webhooks record their timestamp in parallel and wait 5s.
-  // Only the final webhook proceeds to acquire the lock and generate the PDF.
+  // Consolidates rapid back-to-back child/parent updates into a single PDF run.
   if (debounceTarget) {
     var props = PropertiesService.getScriptProperties();
     var debounceKey = "DEBOUNCE_" + debounceTarget;
@@ -66,7 +65,7 @@ function doPost(e) {
       (typeof DEFAULT_TEMPLATE_ID !== "undefined" ? DEFAULT_TEMPLATE_ID : "")
     ).trim();
 
-    // 1. Fetch parent and child records (now that all burst writes have settled)
+    // 1. Fetch parent and child records
     var sheetRowData = getWorkOrderRowDataFromSheet(woNumber, workOrderId);
 
     workOrderId = String(sheetRowData["Work Order ID"] || workOrderId || "").trim();
@@ -102,8 +101,8 @@ function doPost(e) {
       selectedConsumedSerials = rawConsumed.split(/[\s,]+/).filter(Boolean);
     }
 
-    // 4. Reconcile Finished Goods Serials
-    if (workOrderId && productNumber) {
+    // 4. Reconcile Finished Goods Serials (ONLY if Column H Serial Format is defined)
+    if (workOrderId && productNumber && serialFormat !== "") {
       try {
         var serialSheet = getSerialSheet();
         var timestampStr = getFormattedTimestamp();
@@ -123,6 +122,16 @@ function doPost(e) {
         sheetRowData = getWorkOrderRowDataFromSheet(woNumber, workOrderId);
       } catch (reconErr) {
         console.error("Reconciliation error: " + reconErr.toString());
+      }
+    } else if (workOrderId && selectedConsumedSerials.length > 0) {
+      // Non-serialized build (e.g., Service Kit) that still consumes serialized sub-components
+      try {
+        var serialSheet = getSerialSheet();
+        var timestampStr = getFormattedTimestamp();
+        reconcileConsumedUnits(serialSheet, selectedConsumedSerials, workOrderId, "—", timestampStr);
+        sheetRowData = getWorkOrderRowDataFromSheet(woNumber, workOrderId);
+      } catch (consErr) {
+        console.error("Consumed serial reconciliation error: " + consErr.toString());
       }
     }
 
@@ -169,6 +178,7 @@ function getSerialFormatFromProductsSheet(productNumber) {
     var pnCol = headers.indexOf("product number");
     var formatCol = headers.indexOf("serial format");
 
+    // Default to Column H (index 7) if header name differs
     if (formatCol === -1) formatCol = 7;
     if (pnCol === -1) pnCol = 0;
 
@@ -177,7 +187,12 @@ function getSerialFormatFromProductsSheet(productNumber) {
     for (var i = 1; i < data.length; i++) {
       var rowPn = String(data[i][pnCol]).trim().toLowerCase();
       if (rowPn === cleanTargetPn) {
-        return String(data[i][formatCol] || "").replace(/[^A-Za-z0-9]/g, "");
+        var rawFormat = String(data[i][formatCol] || "").replace(/[^A-Za-z0-9]/g, "");
+        var upperFormat = rawFormat.toUpperCase();
+        if (!rawFormat || upperFormat === "NA" || upperFormat === "NONE" || upperFormat === "NULL") {
+          return "";
+        }
+        return rawFormat;
       }
     }
   } catch (err) {
